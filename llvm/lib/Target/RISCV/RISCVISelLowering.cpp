@@ -97,6 +97,11 @@ RISCVTargetLowering::RISCVTargetLowering(const TargetMachine &TM,
     setLoadExtAction(N, XLenVT, MVT::i1, Promote);
 
   // TODO: add all necessary setOperationAction calls.
+
+  /// <<< CodingLab -- Task 1 -- devmtg18
+  // setOperationAction(ISD::BITREVERSE, XLenVT, Legal);
+  /// CodingLab >>>
+
   setOperationAction(ISD::DYNAMIC_STACKALLOC, XLenVT, Expand);
 
   setOperationAction(ISD::BR_JT, MVT::Other, Expand);

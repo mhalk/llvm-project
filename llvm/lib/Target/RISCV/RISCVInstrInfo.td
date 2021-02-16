@@ -829,6 +829,23 @@ def zexti32 : PatFrags<(ops node:$src),
 
 /// Immediates
 
+/// <<< CodingLab -- Task 1 -- devmtg18
+
+def LeadingZeros32 : SDNodeXForm<imm, [{
+		return CurDAG->getTargetConstant(countLeadingZeros<uint32_t>(N->getZExtValue()),
+																		 SDLoc(N), N->getValueType(0));
+	}]>;
+def mask : ImmLeaf<XLenVT, [{return isMask_64(Imm);}]>;
+def : Pat<(mask:$imm), (SRLI (ADDI X0, -1), (LeadingZeros32 imm:$imm))>, Requires<[IsRV32]>;
+
+let hasSideEffects = 0, mayLoad = 0, mayStore = 0, rs2 = 0, hasNoSchedulingInfo = 1 in
+def BITREV : RVInstR<0b1111111, 0b111, OPC_OP, (outs GPR:$rd), (ins GPR:$rs1),
+                     "bitrev", "$rd, $rs1">;
+
+def : Pat<(bitreverse GPR:$rs2), (BITREV GPR:$rs2)>;
+
+/// CodingLab >>>
+
 def : Pat<(simm12:$imm), (ADDI X0, simm12:$imm)>;
 def : Pat<(simm32hi20:$imm), (LUI (HI20 imm:$imm))>;
 def : Pat<(simm32:$imm), (ADDI (LUI (HI20 imm:$imm)), (LO12Sext imm:$imm))>,

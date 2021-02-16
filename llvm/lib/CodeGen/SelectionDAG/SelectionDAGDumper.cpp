@@ -403,7 +403,8 @@ std::string SDNode::getOperationName(const SelectionDAG *G) const {
 
   // Bit manipulation
   case ISD::ABS:                        return "abs";
-  case ISD::BITREVERSE:                 return "bitreverse";
+  case ISD::BITREVERSE:
+  return "bitreverse";
   case ISD::BSWAP:                      return "bswap";
   case ISD::CTPOP:                      return "ctpop";
   case ISD::CTTZ:                       return "cttz";
