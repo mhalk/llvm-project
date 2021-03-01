@@ -218,6 +218,12 @@ foreach i = {1-31} in
 def FeatureSaveRestore : SubtargetFeature<"save-restore", "EnableSaveRestore",
                                           "true", "Enable save/restore.">;
 
+def FeatureMHalk : SubtargetFeature<"xmhalkv", "HasNonStdExtMHalk", "true",
+                                    "'MHalk' (non-standard extension)">;
+def HasNonStdExtMHalk : Predicate<"Subtarget->hasNonStdExtMHalk()">,
+                        AssemblerPredicate<(all_of FeatureMHalk),
+                        "MHalk Instruction Set">;
+
 //===----------------------------------------------------------------------===//
 // Named operands for CSR instructions.
 //===----------------------------------------------------------------------===//
