@@ -19,7 +19,7 @@ let TargetPrefix = "riscv" in {
                             list<IntrinsicProperty> intr_properties> {
 
     def int_riscv_mhalk_ # NAME
-        : GCCBuiltin<"__builtin_pulp_" # NAME>,
+        : GCCBuiltin<"__builtin_mhalk_" # NAME>,
           Intrinsic<ret_types, param_types, intr_properties>;
   }
 
@@ -27,8 +27,8 @@ let TargetPrefix = "riscv" in {
   multiclass MHalkBinary32 : MHalkIntrinsic<[llvm_i32_ty], [llvm_i32_ty, llvm_i32_ty], [IntrNoMem]>;
   multiclass MHalkTernary32 : MHalkIntrinsic<[llvm_i32_ty], [llvm_i32_ty, llvm_i32_ty, llvm_i32_ty], [IntrNoMem]>;
 
-  defm mac : PulpTernary32;
-  
-  defm macs : PulpIntrinsic<[llvm_i32_ty], [llvm_i32_ty, llvm_i32_ty, llvm_i32_ty], [IntrNoMem]>;
-  defm macu : PulpIntrinsic<[llvm_i32_ty], [llvm_i32_ty, llvm_i32_ty, llvm_i32_ty], [IntrNoMem]>;
+  defm mac : MHalkTernary32;
+
+  defm macs : MHalkIntrinsic<[llvm_i32_ty], [llvm_i32_ty, llvm_i32_ty, llvm_i32_ty], [IntrNoMem]>;
+  defm macu : MHalkIntrinsic<[llvm_i32_ty], [llvm_i32_ty, llvm_i32_ty, llvm_i32_ty], [IntrNoMem]>;
 }

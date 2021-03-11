@@ -71,8 +71,9 @@ isExperimentalExtension(StringRef Ext) {
 
 static Optional<RISCVExtensionVersion>
 isNonStandardExtension(StringRef Ext) {
-  if (Ext == "xmhalkv")
+  if (Ext == "xmhalkv") {
     return RISCVExtensionVersion{"2", ""};
+  }
   return None;
 }
 
