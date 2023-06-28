@@ -13,12 +13,11 @@
 #ifndef _OMPTARGET_RTL_H
 #define _OMPTARGET_RTL_H
 
+#include "interop.h"
 #include "omptarget.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/DynamicLibrary.h"
-
-#include "omptarget.h"
 
 #include <list>
 #include <map>
@@ -58,6 +57,7 @@ struct RTLInfoTy {
   typedef int32_t (*register_lib_ty)(__tgt_bin_desc *);
   typedef int32_t(supports_empty_images_ty)();
   typedef void(print_device_info_ty)(int32_t);
+  typedef void(set_interop_info_ty)(omp_interop_val_t *);
   typedef void(set_info_flag_ty)(uint32_t);
   typedef int32_t(create_event_ty)(int32_t, void **);
   typedef int32_t(record_event_ty)(int32_t, void *, __tgt_async_info *);
@@ -112,6 +112,7 @@ struct RTLInfoTy {
   supports_empty_images_ty *supports_empty_images = nullptr;
   set_info_flag_ty *set_info_flag = nullptr;
   print_device_info_ty *print_device_info = nullptr;
+  set_interop_info_ty *set_interop_info = nullptr;
   create_event_ty *create_event = nullptr;
   record_event_ty *record_event = nullptr;
   wait_event_ty *wait_event = nullptr;

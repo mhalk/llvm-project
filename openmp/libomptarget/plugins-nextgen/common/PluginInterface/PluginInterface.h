@@ -26,6 +26,7 @@
 #include "MemoryManager.h"
 #include "RPC.h"
 #include "Utilities.h"
+#include "interop.h"
 #include "omptarget.h"
 
 #ifdef OMPT_SUPPORT
@@ -764,6 +765,10 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
   /// Get the RPC server running on this device.
   RPCServerTy *getRPCServer() const { return RPCServer; }
 
+  virtual Error setInteropInfo(omp_interop_val_t *InterOpPtr) {
+    return Error::success();
+  }
+
 private:
   /// Register offload entry for global variable.
   Error registerGlobalOffloadEntry(DeviceImageTy &DeviceImage,
@@ -957,7 +962,6 @@ struct GenericPluginTy {
   /// Indicate whether the plugin supports empty images.
   virtual bool supportsEmptyImages() const { return false; }
 
-protected:
   /// Indicate whether a device id is valid.
   bool isValidDeviceId(int32_t DeviceId) const {
     return (DeviceId >= 0 && DeviceId < getNumDevices());

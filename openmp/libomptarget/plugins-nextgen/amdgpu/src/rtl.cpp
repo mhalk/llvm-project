@@ -2397,6 +2397,19 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     return Queues[Current % Queues.size()];
   }
 
+  virtual Error setInteropInfo(omp_interop_val_t *InterOpPtr) override {
+    InterOpPtr->vendor_id = amdhsa;
+    InterOpPtr->backend_type_id = omp_interop_backend_type_amdhsa;
+
+    __tgt_device_info *DevInfo = &InterOpPtr->device_info;
+    DevInfo->Context = nullptr;
+    if (!DevInfo->Device) {
+      DevInfo->Device = &Agent;
+    }
+
+    return Plugin::success();
+  }
+
 private:
   using AMDGPUStreamRef = AMDGPUResourceRef<AMDGPUStreamTy>;
   using AMDGPUEventRef = AMDGPUResourceRef<AMDGPUEventTy>;

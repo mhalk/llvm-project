@@ -67,7 +67,8 @@ typedef enum omp_interop_fr {
   omp_ifr_sycl = 4,
   omp_ifr_hip = 5,
   omp_ifr_level_zero = 6,
-  omp_ifr_last = 7
+  omp_ifr_amdhsa = 7,
+  omp_ifr_last = 8
 } omp_interop_fr_t;
 
 typedef void *omp_interop_t;
@@ -118,7 +119,9 @@ omp_get_interop_rc_desc(const omp_interop_t, omp_interop_rc_t);
 
 typedef enum omp_interop_backend_type_t {
   // reserve 0
-  omp_interop_backend_type_cuda_1 = 1,
+  omp_interop_backend_type_cuda = 1,
+  omp_interop_backend_type_amdhsa = 7,
+  omp_interop_backend_type_invalid = 8
 } omp_interop_backend_type_t;
 
 typedef enum kmp_interop_type_t {
@@ -129,26 +132,31 @@ typedef enum kmp_interop_type_t {
 } kmp_interop_type_t;
 
 typedef enum omp_foreign_runtime_ids {
+  invalid = 0,
   cuda = 1,
   cuda_driver = 2,
   opencl = 3,
   sycl = 4,
   hip = 5,
   level_zero = 6,
+  amdhsa = 7
 } omp_foreign_runtime_ids_t;
 
 /// The interop value type, aka. the interop object.
 typedef struct omp_interop_val_t {
   /// Device and interop-type are determined at construction time and fix.
-  omp_interop_val_t(intptr_t device_id, kmp_interop_type_t interop_type)
-      : interop_type(interop_type), device_id(device_id) {}
+  omp_interop_val_t(intptr_t device_id, kmp_interop_type_t interop_type,
+                    omp_foreign_runtime_ids_t vendor_id,
+                    intptr_t backend_type_id)
+      : interop_type(interop_type), device_id(device_id), vendor_id(vendor_id),
+        backend_type_id(backend_type_id) {}
   const char *err_str = nullptr;
   __tgt_async_info *async_info = nullptr;
   __tgt_device_info device_info;
   const kmp_interop_type_t interop_type;
   const intptr_t device_id;
-  const omp_foreign_runtime_ids_t vendor_id = cuda;
-  const intptr_t backend_type_id = omp_interop_backend_type_cuda_1;
+  omp_foreign_runtime_ids_t vendor_id;
+  intptr_t backend_type_id;
 } omp_interop_val_t;
 
 #ifdef __cplusplus

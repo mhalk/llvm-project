@@ -225,6 +225,8 @@ bool RTLsTy::attemptLoadRTL(const std::string &RTLName, RTLInfoTy &RTL) {
       DynLibrary->getAddressOfSymbol("__tgt_rtl_set_info_flag");
   *((void **)&RTL.print_device_info) =
       DynLibrary->getAddressOfSymbol("__tgt_rtl_print_device_info");
+  *((void **)&RTL.set_interop_info) =
+      DynLibrary->getAddressOfSymbol("__tgt_rtl_set_interop_info");
   *((void **)&RTL.create_event) =
       DynLibrary->getAddressOfSymbol("__tgt_rtl_create_event");
   *((void **)&RTL.record_event) =
