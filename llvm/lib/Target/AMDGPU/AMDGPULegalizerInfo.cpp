@@ -53,12 +53,8 @@ static cl::opt<bool> EnableNewLegality(
   cl::ReallyHidden);
 
 // Use FP64 widening for higher accuracy FP32 transcendentals on full-rate FP64
-// architectures (gfx90a, gfx942, gfx950).
-static cl::opt<int> UseFP64ForFP32Trans(
-    "amdgpu-use-fp64-for-fp32-trans",
-    cl::desc("Use FP64 widening for higher accuracy FP32 transcendentals "
-             "(-1=auto based on full-rate FP64, 0=off, 1=on)"),
-    cl::init(-1), cl::Hidden);
+// architectures (gfx90a, gfx942, gfx950). Defined in SIISelLowering.cpp.
+extern cl::opt<int> UseFP64ForFP32Trans;
 
 static constexpr unsigned MaxRegisterSize = 1024;
 

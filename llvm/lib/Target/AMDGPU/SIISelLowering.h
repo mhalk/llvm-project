@@ -129,6 +129,14 @@ private:
   SDValue lowerFSQRTF16(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerFSQRTF32(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerFSQRTF64(SDValue Op, SelectionDAG &DAG) const;
+
+  // FP64-widened intrinsic lowering helpers for higher accuracy
+  SDValue lowerRcpF32ViaF64(SDValue X, SelectionDAG &DAG,
+                            const SDLoc &DL) const;
+  SDValue lowerRsqF32ViaF64(SDValue X, SelectionDAG &DAG,
+                            const SDLoc &DL) const;
+  SDValue lowerSqrtF32ViaF64(SDValue X, SelectionDAG &DAG,
+                             const SDLoc &DL) const;
   SDValue LowerATOMIC_CMP_SWAP(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerBRCOND(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerRETURNADDR(SDValue Op, SelectionDAG &DAG) const;

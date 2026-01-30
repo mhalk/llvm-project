@@ -67,6 +67,14 @@ static cl::opt<bool> UseDivergentRegisterIndexing(
     cl::desc("Use indirect register addressing for divergent indexes"),
     cl::init(false));
 
+// Use FP64 widening for higher accuracy FP32 transcendentals on full-rate FP64
+// architectures (gfx90a, gfx942, gfx950).
+cl::opt<int> UseFP64ForFP32Trans(
+    "amdgpu-use-fp64-for-fp32-trans",
+    cl::desc("Use FP64 widening for higher accuracy FP32 transcendentals "
+             "(-1=auto based on full-rate FP64, 0=off, 1=on)"),
+    cl::init(-1), cl::Hidden);
+
 static bool denormalModeIsFlushAllF32(const MachineFunction &MF) {
   const SIMachineFunctionInfo *Info = MF.getInfo<SIMachineFunctionInfo>();
   return Info->getMode().FP32Denormals == DenormalMode::getPreserveSign();
@@ -10047,10 +10055,37 @@ SDValue SITargetLowering::LowerINTRINSIC_WO_CHAIN(SDValue Op,
   case Intrinsic::amdgcn_dispatch_id: {
     return getPreloadedValue(DAG, *MFI, VT, AMDGPUFunctionArgInfo::DISPATCH_ID);
   }
-  case Intrinsic::amdgcn_rcp:
-    return DAG.getNode(AMDGPUISD::RCP, DL, VT, Op.getOperand(1));
-  case Intrinsic::amdgcn_rsq:
-    return DAG.getNode(AMDGPUISD::RSQ, DL, VT, Op.getOperand(1));
+  case Intrinsic::amdgcn_rcp: {
+    SDValue X = Op.getOperand(1);
+    // Use FP64 widening for f32 on full-rate FP64 architectures, unless afn
+    if (VT == MVT::f32 && !Op->getFlags().hasApproximateFuncs() &&
+        ((UseFP64ForFP32Trans == 1) ||
+         (UseFP64ForFP32Trans == -1 && Subtarget->hasFullRate64Ops())))
+      return lowerRcpF32ViaF64(X, DAG, DL);
+    return DAG.getNode(AMDGPUISD::RCP, DL, VT, X);
+  }
+  case Intrinsic::amdgcn_rsq: {
+    SDValue X = Op.getOperand(1);
+    // Use FP64 widening for f32 on full-rate FP64 architectures, unless afn
+    if (VT == MVT::f32 && !Op->getFlags().hasApproximateFuncs() &&
+        ((UseFP64ForFP32Trans == 1) ||
+         (UseFP64ForFP32Trans == -1 && Subtarget->hasFullRate64Ops())))
+      return lowerRsqF32ViaF64(X, DAG, DL);
+    return DAG.getNode(AMDGPUISD::RSQ, DL, VT, X);
+  }
+  case Intrinsic::amdgcn_sqrt: {
+    SDValue X = Op.getOperand(1);
+    // Skip FP64 widening if afn (approximate) flag is set
+    if (Op->getFlags().hasApproximateFuncs())
+      return SDValue(); // Fall through to default pattern matching
+    // Use FP64 widening for f32 on full-rate FP64 architectures
+    if (VT == MVT::f32 &&
+        ((UseFP64ForFP32Trans == 1) ||
+         (UseFP64ForFP32Trans == -1 && Subtarget->hasFullRate64Ops())))
+      return lowerSqrtF32ViaF64(X, DAG, DL);
+    // Fall through to default pattern matching
+    return SDValue();
+  }
   case Intrinsic::amdgcn_rsq_legacy:
     if (Subtarget->getGeneration() >= AMDGPUSubtarget::VOLCANIC_ISLANDS)
       return emitRemovedIntrinsicError(DAG, DL, VT);
@@ -12349,11 +12384,17 @@ SDValue SITargetLowering::lowerFastUnsafeFDIV(SDValue Op,
 
   bool AllowInaccurateRcp = Flags.hasApproximateFuncs();
 
+  // Check if we should use FP64-widened RCP for f32 (higher accuracy)
+  bool UseF64Rcp =
+      VT == MVT::f32 &&
+      ((UseFP64ForFP32Trans == 1) ||
+       (UseFP64ForFP32Trans == -1 && Subtarget->hasFullRate64Ops()));
+
   if (const ConstantFPSDNode *CLHS = dyn_cast<ConstantFPSDNode>(LHS)) {
     // Without !fpmath accuracy information, we can't do more because we don't
     // know exactly whether rcp is accurate enough to meet !fpmath requirement.
-    // f16 is always accurate enough
-    if (!AllowInaccurateRcp && VT != MVT::f16 && VT != MVT::bf16)
+    // f16 is always accurate enough. FP64-widened is always accurate enough.
+    if (!AllowInaccurateRcp && !UseF64Rcp && VT != MVT::f16 && VT != MVT::bf16)
       return SDValue();
 
     if (CLHS->isExactlyValue(1.0)) {
@@ -12368,14 +12409,20 @@ SDValue SITargetLowering::lowerFastUnsafeFDIV(SDValue Op,
 
       // XXX - Is afn sufficient to do this for f64? The maximum ULP
       // error seems really high at 2^29 ULP.
+
+      // Use FP64-widened RCP for higher accuracy on full-rate FP64
       // 1.0 / x -> rcp(x)
+      if (UseF64Rcp)
+        return lowerRcpF32ViaF64(RHS, DAG, SL);
       return DAG.getNode(AMDGPUISD::RCP, SL, VT, RHS);
     }
 
     // Same as for 1.0, but expand the sign out of the constant.
+    // -1.0 / x -> rcp(fneg x)
     if (CLHS->isExactlyValue(-1.0)) {
-      // -1.0 / x -> rcp (fneg x)
       SDValue FNegRHS = DAG.getNode(ISD::FNEG, SL, VT, RHS);
+      if (UseF64Rcp)
+        return lowerRcpF32ViaF64(FNegRHS, DAG, SL);
       return DAG.getNode(AMDGPUISD::RCP, SL, VT, FNegRHS);
     }
   }
@@ -12919,6 +12966,111 @@ SDValue SITargetLowering::lowerFSQRTF16(SDValue Op, SelectionDAG &DAG) const {
                      DAG.getTargetConstant(0, SL, MVT::i32), Flags);
 }
 
+// FP64-widened RCP for higher accuracy F32 reciprocal.
+// Computes rcp(x) via: widen to f64, v_rcp_f64, NR refinement, narrow to f32.
+SDValue SITargetLowering::lowerRcpF32ViaF64(SDValue X, SelectionDAG &DAG,
+                                            const SDLoc &DL) const {
+  SDNodeFlags Flags;
+  MVT F64 = MVT::f64;
+  MVT F32 = MVT::f32;
+
+  // Widen input to f64
+  SDValue XF64 = DAG.getNode(ISD::FP_EXTEND, DL, F64, X, Flags);
+  // Compute rcp(f64)
+  SDValue Rcp = DAG.getNode(AMDGPUISD::RCP, DL, F64, XF64);
+  // Newton-Raphson: error = rcp * (-x) + 1.0
+  SDValue NegXF64 = DAG.getNode(ISD::FNEG, DL, F64, XF64, Flags);
+  SDValue One = DAG.getConstantFP(1.0, DL, F64);
+  SDValue Error = DAG.getNode(ISD::FMA, DL, F64, Rcp, NegXF64, One, Flags);
+  // refined_rcp = error * rcp + rcp
+  SDValue RefinedRcp = DAG.getNode(ISD::FMA, DL, F64, Error, Rcp, Rcp, Flags);
+  // Convert result back to f32
+  SDValue RcpF32 = DAG.getNode(ISD::FP_ROUND, DL, F32, RefinedRcp,
+                               DAG.getTargetConstant(0, DL, MVT::i32), Flags);
+  // Also convert initial estimate for special value handling
+  SDValue RcpInitF32 =
+      DAG.getNode(ISD::FP_ROUND, DL, F32, Rcp,
+                  DAG.getTargetConstant(0, DL, MVT::i32), Flags);
+  // Handle special values: ±inf, NaN should use initial estimate
+  SDValue IsSpecial =
+      DAG.getNode(ISD::IS_FPCLASS, DL, MVT::i1, X,
+                  DAG.getTargetConstant(fcInf | fcNan, DL, MVT::i32));
+  return DAG.getNode(ISD::SELECT, DL, F32, IsSpecial, RcpInitF32, RcpF32,
+                     Flags);
+}
+
+// FP64-widened RSQ for higher accuracy F32 reciprocal square root.
+// Computes rsq(x) via: widen to f64, v_rsq_f64, NR refinement, narrow to f32.
+SDValue SITargetLowering::lowerRsqF32ViaF64(SDValue X, SelectionDAG &DAG,
+                                            const SDLoc &DL) const {
+  SDNodeFlags Flags;
+  MVT F64 = MVT::f64;
+  MVT F32 = MVT::f32;
+
+  // Widen input to f64
+  SDValue XF64 = DAG.getNode(ISD::FP_EXTEND, DL, F64, X, Flags);
+  // Compute rsq(f64)
+  SDValue Rsq = DAG.getNode(AMDGPUISD::RSQ, DL, F64, XF64);
+  // Newton-Raphson: rsq^2
+  SDValue RsqSq = DAG.getNode(ISD::FMUL, DL, F64, Rsq, Rsq, Flags);
+  // error = rsq^2 * (-x) + 1.0
+  SDValue NegXF64 = DAG.getNode(ISD::FNEG, DL, F64, XF64, Flags);
+  SDValue One = DAG.getConstantFP(1.0, DL, F64);
+  SDValue Error = DAG.getNode(ISD::FMA, DL, F64, RsqSq, NegXF64, One, Flags);
+  // half_error = 0.5 * error
+  SDValue Half = DAG.getConstantFP(0.5, DL, F64);
+  SDValue HalfError = DAG.getNode(ISD::FMUL, DL, F64, Half, Error, Flags);
+  // refined_rsq = half_error * rsq + rsq
+  SDValue RefinedRsq =
+      DAG.getNode(ISD::FMA, DL, F64, HalfError, Rsq, Rsq, Flags);
+  // Convert result back to f32
+  SDValue RsqF32 = DAG.getNode(ISD::FP_ROUND, DL, F32, RefinedRsq,
+                               DAG.getTargetConstant(0, DL, MVT::i32), Flags);
+  // Also convert initial estimate for special value handling
+  SDValue RsqInitF32 =
+      DAG.getNode(ISD::FP_ROUND, DL, F32, Rsq,
+                  DAG.getTargetConstant(0, DL, MVT::i32), Flags);
+  // Handle special values: 0, +inf, NaN should use initial estimate
+  SDValue IsSpecial = DAG.getNode(
+      ISD::IS_FPCLASS, DL, MVT::i1, X,
+      DAG.getTargetConstant(fcZero | fcPosInf | fcNan, DL, MVT::i32));
+  return DAG.getNode(ISD::SELECT, DL, F32, IsSpecial, RsqInitF32, RsqF32,
+                     Flags);
+}
+
+// FP64-widened SQRT for higher accuracy F32 square root.
+// Computes sqrt(x) via: widen to f64, rsq + NR refinement, x * rsq, narrow.
+SDValue SITargetLowering::lowerSqrtF32ViaF64(SDValue X, SelectionDAG &DAG,
+                                             const SDLoc &DL) const {
+  SDNodeFlags Flags;
+  MVT F64 = MVT::f64;
+  MVT F32 = MVT::f32;
+
+  // Widen input to f64
+  SDValue XF64 = DAG.getNode(ISD::FP_EXTEND, DL, F64, X, Flags);
+  // Compute rsq(f64)
+  SDValue Rsq = DAG.getNode(AMDGPUISD::RSQ, DL, F64, XF64);
+  // Newton-Raphson for rsq refinement
+  SDValue RsqSq = DAG.getNode(ISD::FMUL, DL, F64, Rsq, Rsq, Flags);
+  SDValue NegXF64 = DAG.getNode(ISD::FNEG, DL, F64, XF64, Flags);
+  SDValue One = DAG.getConstantFP(1.0, DL, F64);
+  SDValue Error = DAG.getNode(ISD::FMA, DL, F64, RsqSq, NegXF64, One, Flags);
+  SDValue Half = DAG.getConstantFP(0.5, DL, F64);
+  SDValue HalfError = DAG.getNode(ISD::FMUL, DL, F64, Half, Error, Flags);
+  SDValue RefinedRsq =
+      DAG.getNode(ISD::FMA, DL, F64, HalfError, Rsq, Rsq, Flags);
+  // sqrt = x * refined_rsq
+  SDValue SqrtF64 = DAG.getNode(ISD::FMUL, DL, F64, XF64, RefinedRsq, Flags);
+  // Convert result back to f32
+  SDValue SqrtF32 = DAG.getNode(ISD::FP_ROUND, DL, F32, SqrtF64,
+                                DAG.getTargetConstant(0, DL, MVT::i32), Flags);
+  // Handle special values: 0, +inf, NaN return input
+  SDValue IsSpecial = DAG.getNode(
+      ISD::IS_FPCLASS, DL, MVT::i1, X,
+      DAG.getTargetConstant(fcZero | fcPosInf | fcNan, DL, MVT::i32));
+  return DAG.getNode(ISD::SELECT, DL, F32, IsSpecial, X, SqrtF32, Flags);
+}
+
 SDValue SITargetLowering::lowerFSQRTF32(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   SDNodeFlags Flags = Op->getFlags();
@@ -12931,6 +13083,12 @@ SDValue SITargetLowering::lowerFSQRTF32(SDValue Op, SelectionDAG &DAG) const {
         ISD::INTRINSIC_WO_CHAIN, DL, VT,
         DAG.getTargetConstant(Intrinsic::amdgcn_sqrt, DL, MVT::i32), X, Flags);
   }
+
+  // Check if we should use FP64-widened sequence for higher accuracy
+  bool UseF64 = (UseFP64ForFP32Trans == 1) ||
+                (UseFP64ForFP32Trans == -1 && Subtarget->hasFullRate64Ops());
+  if (UseF64)
+    return lowerSqrtF32ViaF64(X, DAG, DL);
 
   SDValue ScaleThreshold = DAG.getConstantFP(0x1.0p-96f, DL, VT);
   SDValue NeedScale = DAG.getSetCC(DL, MVT::i1, X, ScaleThreshold, ISD::SETOLT);
