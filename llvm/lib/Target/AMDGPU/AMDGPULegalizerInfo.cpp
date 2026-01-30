@@ -52,6 +52,14 @@ static cl::opt<bool> EnableNewLegality(
   cl::init(false),
   cl::ReallyHidden);
 
+// Use FP64 widening for higher accuracy FP32 transcendentals on full-rate FP64
+// architectures (gfx90a, gfx942, gfx950).
+static cl::opt<int> UseFP64ForFP32Trans(
+    "amdgpu-use-fp64-for-fp32-trans",
+    cl::desc("Use FP64 widening for higher accuracy FP32 transcendentals "
+             "(-1=auto based on full-rate FP64, 0=off, 1=on)"),
+    cl::init(-1), cl::Hidden);
+
 static constexpr unsigned MaxRegisterSize = 1024;
 
 // Round the number of elements to the next power of two elements
@@ -5186,6 +5194,42 @@ bool AMDGPULegalizerInfo::legalizeSignedDIV_REM(MachineInstr &MI,
   return true;
 }
 
+// Helper to build FP64-widened RCP sequence, returning the result register.
+// This is used by legalizeFastUnsafeFDIV for 1.0/x patterns on full-rate FP64.
+Register AMDGPULegalizerInfo::buildRcpF32ViaF64(MachineIRBuilder &B, Register X,
+                                                unsigned Flags) const {
+  const LLT S1 = LLT::scalar(1);
+  const LLT F32 = LLT::scalar(32);
+  const LLT F64 = LLT::scalar(64);
+
+  // Widen input to f64
+  auto XF64 = B.buildFPExt(F64, X, Flags);
+
+  // Compute rcp(f64)
+  auto Rcp = B.buildIntrinsic(Intrinsic::amdgcn_rcp, {F64})
+                 .addReg(XF64.getReg(0))
+                 .setMIFlags(Flags);
+
+  // Newton-Raphson iteration: error = rcp * (-x) + 1.0
+  auto NegXF64 = B.buildFNeg(F64, XF64, Flags);
+  auto One = B.buildFConstant(F64, 1.0);
+  auto Error = B.buildFMA(F64, Rcp, NegXF64, One, Flags);
+  // refined_rcp = error * rcp + rcp
+  auto RefinedRcp = B.buildFMA(F64, Error, Rcp, Rcp, Flags);
+
+  // Convert result back to f32
+  auto RcpF32 = B.buildFPTrunc(F32, RefinedRcp, Flags);
+
+  // Also convert the initial estimate for special value handling
+  auto RcpInitF32 = B.buildFPTrunc(F32, Rcp, Flags);
+
+  // Handle special values: ±inf, NaN should use the initial estimate
+  auto IsSpecial = B.buildIsFPClass(S1, X, fcInf | fcNan);
+  auto Result = B.buildSelect(F32, IsSpecial, RcpInitF32, RcpF32, Flags);
+
+  return Result.getReg(0);
+}
+
 bool AMDGPULegalizerInfo::legalizeFastUnsafeFDIV(MachineInstr &MI,
                                                  MachineRegisterInfo &MRI,
                                                  MachineIRBuilder &B) const {
@@ -5197,8 +5241,12 @@ bool AMDGPULegalizerInfo::legalizeFastUnsafeFDIV(MachineInstr &MI,
 
   bool AllowInaccurateRcp = MI.getFlag(MachineInstr::FmAfn);
 
+  // Check if we should use FP64-widened RCP for f32 (higher accuracy)
+  bool UseF64Rcp =
+      ResTy == LLT::scalar(32) && useFP64ForFP32Trans() && !AllowInaccurateRcp;
+
   if (const auto *CLHS = getConstantFPVRegVal(LHS, MRI)) {
-    if (!AllowInaccurateRcp && ResTy != LLT::scalar(16))
+    if (!AllowInaccurateRcp && !UseF64Rcp && ResTy != LLT::scalar(16))
       return false;
 
     // v_rcp_f32 and v_rsq_f32 do not support denormals, and according to
@@ -5208,22 +5256,32 @@ bool AMDGPULegalizerInfo::legalizeFastUnsafeFDIV(MachineInstr &MI,
     //
     // v_rcp_f16 and v_rsq_f16 DO support denormals and 0.51ulp.
 
-    // 1 / x -> RCP(x)
+    // 1 / x -> RCP(x) or FP64-widened RCP(x)
     if (CLHS->isExactlyValue(1.0)) {
-      B.buildIntrinsic(Intrinsic::amdgcn_rcp, Res)
-          .addUse(RHS)
-          .setMIFlags(Flags);
+      if (UseF64Rcp) {
+        Register RcpResult = buildRcpF32ViaF64(B, RHS, Flags);
+        B.buildCopy(Res, RcpResult);
+      } else {
+        B.buildIntrinsic(Intrinsic::amdgcn_rcp, Res)
+            .addUse(RHS)
+            .setMIFlags(Flags);
+      }
 
       MI.eraseFromParent();
       return true;
     }
 
-    // -1 / x -> RCP( FNEG(x) )
+    // -1 / x -> RCP( FNEG(x) ) or FP64-widened version
     if (CLHS->isExactlyValue(-1.0)) {
       auto FNeg = B.buildFNeg(ResTy, RHS, Flags);
-      B.buildIntrinsic(Intrinsic::amdgcn_rcp, Res)
-          .addUse(FNeg.getReg(0))
-          .setMIFlags(Flags);
+      if (UseF64Rcp) {
+        Register RcpResult = buildRcpF32ViaF64(B, FNeg.getReg(0), Flags);
+        B.buildCopy(Res, RcpResult);
+      } else {
+        B.buildIntrinsic(Intrinsic::amdgcn_rcp, Res)
+            .addUse(FNeg.getReg(0))
+            .setMIFlags(Flags);
+      }
 
       MI.eraseFromParent();
       return true;
@@ -5787,12 +5845,262 @@ bool AMDGPULegalizerInfo::legalizeFSQRTF64(MachineInstr &MI,
   return true;
 }
 
+bool AMDGPULegalizerInfo::useFP64ForFP32Trans() const {
+  // Check command-line override first
+  if (UseFP64ForFP32Trans == 0)
+    return false;
+  if (UseFP64ForFP32Trans == 1)
+    return true;
+  // Auto mode: use FP64 widening on full-rate FP64 architectures
+  return ST.hasFullRate64Ops();
+}
+
+// Legalize F32 rcp/rsq intrinsics, optionally using FP64 widening for higher
+// accuracy on full-rate FP64 architectures.
+bool AMDGPULegalizerInfo::legalizeRcpRsqF32(MachineInstr &MI,
+                                            MachineRegisterInfo &MRI,
+                                            MachineIRBuilder &B,
+                                            Intrinsic::ID IID) const {
+  Register Dst = MI.getOperand(0).getReg();
+  LLT DstTy = MRI.getType(Dst);
+
+  // Only apply FP64 widening for F32, when enabled, and without afn flag
+  if (DstTy != LLT::scalar(32) || !useFP64ForFP32Trans() ||
+      MI.getFlag(MachineInstr::FmAfn))
+    return true; // Pass through to instruction selection
+
+  switch (IID) {
+  case Intrinsic::amdgcn_rcp:
+    return legalizeRcpF32ViaF64(MI, B);
+  case Intrinsic::amdgcn_rsq:
+    return legalizeRsqF32ViaF64(MI, B);
+  default:
+    llvm_unreachable("unexpected intrinsic");
+  }
+}
+
+// Legalize amdgcn_sqrt intrinsic for F32 - use FP64 widening if enabled
+bool AMDGPULegalizerInfo::legalizeSqrtF32(MachineInstr &MI,
+                                          MachineRegisterInfo &MRI,
+                                          MachineIRBuilder &B) const {
+  Register Dst = MI.getOperand(0).getReg();
+  LLT DstTy = MRI.getType(Dst);
+
+  // Only apply FP64 widening for F32, when enabled, and without afn flag
+  if (DstTy != LLT::scalar(32) || !useFP64ForFP32Trans() ||
+      MI.getFlag(MachineInstr::FmAfn))
+    return true; // Pass through to instruction selection
+
+  // For intrinsics: operand 0 = dst, operand 1 = intrinsic ID, operand 2 = src
+  Register X = MI.getOperand(2).getReg();
+  const unsigned Flags = MI.getFlags();
+
+  const LLT S1 = LLT::scalar(1);
+  const LLT F32 = LLT::scalar(32);
+  const LLT F64 = LLT::scalar(64);
+
+  // sqrt(x) via FP64 widening: widen, rsq, refine, multiply, narrow
+  auto XF64 = B.buildFPExt(F64, X, Flags);
+
+  // Compute rsq(f64)
+  auto Rsq = B.buildIntrinsic(Intrinsic::amdgcn_rsq, {F64})
+                 .addUse(XF64.getReg(0))
+                 .setMIFlags(Flags);
+
+  // Newton-Raphson refinement for rsq:
+  // rsq^2
+  auto RsqSq = B.buildFMul(F64, Rsq, Rsq, Flags);
+  // error = rsq^2 * (-x) + 1.0
+  auto NegXF64 = B.buildFNeg(F64, XF64, Flags);
+  auto One = B.buildFConstant(F64, 1.0);
+  auto Error = B.buildFMA(F64, RsqSq, NegXF64, One, Flags);
+  // half_error = 0.5 * error
+  auto Half = B.buildFConstant(F64, 0.5);
+  auto HalfError = B.buildFMul(F64, Half, Error, Flags);
+  // refined_rsq = half_error * rsq + rsq
+  auto RefinedRsq = B.buildFMA(F64, HalfError, Rsq, Rsq, Flags);
+
+  // sqrt = x * refined_rsq
+  auto SqrtF64 = B.buildFMul(F64, XF64, RefinedRsq, Flags);
+
+  // Convert back to f32
+  auto SqrtF32 = B.buildFPTrunc(F32, SqrtF64, Flags);
+
+  // Handle special values: ±0, +inf, NaN return input
+  auto IsSpecial = B.buildIsFPClass(S1, X, fcZero | fcPosInf | fcNan);
+  B.buildSelect(Dst, IsSpecial, X, SqrtF32, Flags);
+
+  MI.eraseFromParent();
+  return true;
+}
+
+// Implement sqrt(f32) via FP64 widening for higher accuracy on full-rate FP64
+// architectures. The sequence is:
+//   1. Widen input to f64
+//   2. Compute rsq(f64) and refine with Newton-Raphson
+//   3. Multiply by input to get sqrt
+//   4. Convert back to f32
+//   5. Handle special values (±0, ±inf, NaN)
+bool AMDGPULegalizerInfo::legalizeFSQRTF32ViaF64(MachineInstr &MI,
+                                                 MachineIRBuilder &B) const {
+  Register Dst = MI.getOperand(0).getReg();
+  Register X = MI.getOperand(1).getReg();
+  const unsigned Flags = MI.getFlags();
+
+  const LLT S1 = LLT::scalar(1);
+  const LLT F32 = LLT::scalar(32);
+  const LLT F64 = LLT::scalar(64);
+
+  // Widen input to f64
+  auto XF64 = B.buildFPExt(F64, X, Flags);
+
+  // Compute rsq(f64)
+  auto Rsq = B.buildIntrinsic(Intrinsic::amdgcn_rsq, {F64})
+                 .addReg(XF64.getReg(0))
+                 .setMIFlags(Flags);
+
+  // Newton-Raphson iteration for rsq:
+  //   rsq^2
+  auto RsqSq = B.buildFMul(F64, Rsq, Rsq, Flags);
+  //   error = rsq^2 * (-x) + 1.0
+  auto NegXF64 = B.buildFNeg(F64, XF64, Flags);
+  auto One = B.buildFConstant(F64, 1.0);
+  auto Error = B.buildFMA(F64, RsqSq, NegXF64, One, Flags);
+  //   error * 0.5
+  auto Half = B.buildFConstant(F64, 0.5);
+  auto HalfError = B.buildFMul(F64, Half, Error, Flags);
+  //   refined_rsq = half_error * rsq + rsq
+  auto RefinedRsq = B.buildFMA(F64, HalfError, Rsq, Rsq, Flags);
+
+  // sqrt = x * refined_rsq
+  auto SqrtF64 = B.buildFMul(F64, XF64, RefinedRsq, Flags);
+
+  // Convert result back to f32
+  auto SqrtF32 = B.buildFPTrunc(F32, SqrtF64, Flags);
+
+  // Handle special values: ±0, +inf, NaN should return the original input
+  // Class mask 0x260 = fcZero | fcPosInf | fcNan (±0, +inf, NaN)
+  auto IsSpecial = B.buildIsFPClass(S1, X, fcZero | fcPosInf | fcNan);
+  B.buildSelect(Dst, IsSpecial, X, SqrtF32, Flags);
+
+  MI.eraseFromParent();
+  return true;
+}
+
+// Implement rcp(f32) via FP64 widening for higher accuracy on full-rate FP64
+// architectures. The sequence is:
+//   1. Widen input to f64
+//   2. Compute rcp(f64)
+//   3. Newton-Raphson refinement in f64
+//   4. Convert back to f32
+//   5. Handle special values (±inf, NaN)
+bool AMDGPULegalizerInfo::legalizeRcpF32ViaF64(MachineInstr &MI,
+                                               MachineIRBuilder &B) const {
+  Register Dst = MI.getOperand(0).getReg();
+  // For intrinsics, operand 2 is the source (operand 1 is the intrinsic ID)
+  Register X = MI.getOperand(2).getReg();
+  const unsigned Flags = MI.getFlags();
+
+  const LLT S1 = LLT::scalar(1);
+  const LLT F32 = LLT::scalar(32);
+  const LLT F64 = LLT::scalar(64);
+
+  // Widen input to f64
+  auto XF64 = B.buildFPExt(F64, X, Flags);
+
+  // Compute rcp(f64)
+  auto Rcp = B.buildIntrinsic(Intrinsic::amdgcn_rcp, {F64})
+                 .addReg(XF64.getReg(0))
+                 .setMIFlags(Flags);
+
+  // Newton-Raphson iteration for rcp:
+  //   error = rcp * (-x) + 1.0
+  auto NegXF64 = B.buildFNeg(F64, XF64, Flags);
+  auto One = B.buildFConstant(F64, 1.0);
+  auto Error = B.buildFMA(F64, Rcp, NegXF64, One, Flags);
+  //   refined_rcp = error * rcp + rcp
+  auto RefinedRcp = B.buildFMA(F64, Error, Rcp, Rcp, Flags);
+
+  // Convert result back to f32
+  auto RcpF32 = B.buildFPTrunc(F32, RefinedRcp, Flags);
+
+  // Also convert the initial estimate for special value handling
+  auto RcpInitF32 = B.buildFPTrunc(F32, Rcp, Flags);
+
+  // Handle special values: ±inf, NaN should use the initial estimate
+  auto IsSpecial = B.buildIsFPClass(S1, X, fcInf | fcNan);
+  B.buildSelect(Dst, IsSpecial, RcpInitF32, RcpF32, Flags);
+
+  MI.eraseFromParent();
+  return true;
+}
+
+// Implement rsq(f32) via FP64 widening for higher accuracy on full-rate FP64
+// architectures. The sequence is:
+//   1. Widen input to f64
+//   2. Compute rsq(f64)
+//   3. Newton-Raphson refinement in f64
+//   4. Convert back to f32
+//   5. Handle special values (±0, ±inf, NaN)
+bool AMDGPULegalizerInfo::legalizeRsqF32ViaF64(MachineInstr &MI,
+                                               MachineIRBuilder &B) const {
+  Register Dst = MI.getOperand(0).getReg();
+  // For intrinsics, operand 2 is the source (operand 1 is the intrinsic ID)
+  Register X = MI.getOperand(2).getReg();
+  const unsigned Flags = MI.getFlags();
+
+  const LLT S1 = LLT::scalar(1);
+  const LLT F32 = LLT::scalar(32);
+  const LLT F64 = LLT::scalar(64);
+
+  // Widen input to f64
+  auto XF64 = B.buildFPExt(F64, X, Flags);
+
+  // Compute rsq(f64)
+  auto Rsq = B.buildIntrinsic(Intrinsic::amdgcn_rsq, {F64})
+                 .addReg(XF64.getReg(0))
+                 .setMIFlags(Flags);
+
+  // Newton-Raphson iteration for rsq:
+  //   rsq^2
+  auto RsqSq = B.buildFMul(F64, Rsq, Rsq, Flags);
+  //   error = rsq^2 * (-x) + 1.0
+  auto NegXF64 = B.buildFNeg(F64, XF64, Flags);
+  auto One = B.buildFConstant(F64, 1.0);
+  auto Error = B.buildFMA(F64, RsqSq, NegXF64, One, Flags);
+  //   error * 0.5
+  auto Half = B.buildFConstant(F64, 0.5);
+  auto HalfError = B.buildFMul(F64, Half, Error, Flags);
+  //   refined_rsq = half_error * rsq + rsq
+  auto RefinedRsq = B.buildFMA(F64, HalfError, Rsq, Rsq, Flags);
+
+  // Convert result back to f32
+  auto RsqF32 = B.buildFPTrunc(F32, RefinedRsq, Flags);
+
+  // Also convert the initial estimate for special value handling
+  auto RsqInitF32 = B.buildFPTrunc(F32, Rsq, Flags);
+
+  // Handle special values: ±0, ±inf, NaN should use the initial estimate
+  // Class mask 0x260 = fcZero | fcInf | fcNan
+  auto IsSpecial = B.buildIsFPClass(S1, X, fcZero | fcInf | fcNan);
+  B.buildSelect(Dst, IsSpecial, RsqInitF32, RsqF32, Flags);
+
+  MI.eraseFromParent();
+  return true;
+}
+
 bool AMDGPULegalizerInfo::legalizeFSQRT(MachineInstr &MI,
                                         MachineRegisterInfo &MRI,
                                         MachineIRBuilder &B) const {
   LLT Ty = MRI.getType(MI.getOperand(0).getReg());
-  if (Ty == LLT::scalar(32))
+  if (Ty == LLT::scalar(32)) {
+    // Use FP64-widened sequence on full-rate FP64 architectures for higher
+    // accuracy when not using approximate math.
+    MachineFunction &MF = B.getMF();
+    if (useFP64ForFP32Trans() && !allowApproxFunc(MF, MI.getFlags()))
+      return legalizeFSQRTF32ViaF64(MI, B);
     return legalizeFSQRTF32(MI, MRI, B);
+  }
   if (Ty == LLT::scalar(64))
     return legalizeFSQRTF64(MI, MRI, B);
   if (Ty == LLT::scalar(16))
@@ -8082,6 +8390,11 @@ bool AMDGPULegalizerInfo::legalizeIntrinsic(LegalizerHelper &Helper,
   case Intrinsic::amdgcn_struct_buffer_atomic_fadd:
   case Intrinsic::amdgcn_struct_ptr_buffer_atomic_fadd:
     return legalizeBufferAtomic(MI, B, IntrID);
+  case Intrinsic::amdgcn_rcp:
+  case Intrinsic::amdgcn_rsq:
+    return legalizeRcpRsqF32(MI, MRI, B, IntrID);
+  case Intrinsic::amdgcn_sqrt:
+    return legalizeSqrtF32(MI, MRI, B);
   case Intrinsic::amdgcn_rsq_clamp:
     return legalizeRsqClampIntrinsic(MI, MRI, B);
   case Intrinsic::amdgcn_image_bvh_intersect_ray:

@@ -177,10 +177,29 @@ public:
                         MachineIRBuilder &B) const;
   bool legalizeFSQRTF32(MachineInstr &MI, MachineRegisterInfo &MRI,
                         MachineIRBuilder &B) const;
+  bool legalizeFSQRTF32ViaF64(MachineInstr &MI, MachineIRBuilder &B) const;
   bool legalizeFSQRTF64(MachineInstr &MI, MachineRegisterInfo &MRI,
                         MachineIRBuilder &B) const;
   bool legalizeFSQRT(MachineInstr &MI, MachineRegisterInfo &MRI,
                      MachineIRBuilder &B) const;
+
+  bool legalizeRcpF32ViaF64(MachineInstr &MI, MachineIRBuilder &B) const;
+  bool legalizeRsqF32ViaF64(MachineInstr &MI, MachineIRBuilder &B) const;
+
+  /// Build FP64-widened RCP sequence, returning the result register.
+  Register buildRcpF32ViaF64(MachineIRBuilder &B, Register X,
+                             unsigned Flags) const;
+
+  /// Check if FP64 widening should be used for FP32 transcendentals.
+  bool useFP64ForFP32Trans() const;
+
+  /// Legalize F32 rcp/rsq intrinsics, using FP64 widening when appropriate.
+  bool legalizeRcpRsqF32(MachineInstr &MI, MachineRegisterInfo &MRI,
+                         MachineIRBuilder &B, Intrinsic::ID IID) const;
+
+  /// Legalize F32 sqrt intrinsic, using FP64 widening when appropriate.
+  bool legalizeSqrtF32(MachineInstr &MI, MachineRegisterInfo &MRI,
+                       MachineIRBuilder &B) const;
 
   bool legalizeRsqClampIntrinsic(MachineInstr &MI, MachineRegisterInfo &MRI,
                                  MachineIRBuilder &B) const;
